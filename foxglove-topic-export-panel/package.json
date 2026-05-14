@@ -1,0 +1,42 @@
+{
+  "name": "roi-z-avg-export-panel",
+  "displayName": "Axera ROI Z Avg Export Panel",
+  "description": "Browse roi_z_avg messages across an MCAP and export them as Excel.",
+  "publisher": "axera",
+  "homepage": "",
+  "version": "0.3.0",
+  "license": "UNLICENSED",
+  "main": "./dist/extension.js",
+  "keywords": [
+    "foxglove",
+    "mcap",
+    "excel",
+    "xlsx",
+    "export"
+  ],
+  "scripts": {
+    "build": "foxglove-extension build",
+    "foxglove:prepublish": "foxglove-extension build --mode production",
+    "lint": "eslint .",
+    "lint:ci": "eslint .",
+    "lint:fix": "eslint --fix .",
+    "local-install": "foxglove-extension install",
+    "package": "foxglove-extension package",
+    "pretest": "foxglove-extension pretest"
+  },
+  "devDependencies": {
+    "@foxglove/eslint-plugin": "2.1.0",
+    "@foxglove/extension": "2.48.0",
+    "@types/react": "18.3.28",
+    "@types/react-dom": "18.3.7",
+    "create-foxglove-extension": "1.3.0",
+    "eslint": "9.39.4",
+    "prettier": "3.8.1",
+    "react": "18.3.1",
+    "react-dom": "18.3.1",
+    "typescript": "5.9.3"
+  },
+  "dependencies": {
+    "exceljs": "4.4.0"
+  }
+}
