@@ -1,11 +1,12 @@
 #ifndef _SAMPLE_NPU_ENGINE_H_
 #define _SAMPLE_NPU_ENGINE_H_
 
+// Host/AXCL port: the NPU is reached over PCIe through libaxcl_rt, so this
+// header only needs the AX data types (frame description, scalar typedefs).
+// The implementation lives in host_backend/sample_engine_axcl.cpp.
 #include <ax_base_type.h>
 #include <ax_global_type.h>
-#include "ax_engine_api.h"
-#include "ax_ivps_api.h"
-#include "ax_sys_api.h"
+#include <ax_pool_type.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -29,6 +30,9 @@ AX_S32 sample_run_axmodel(const AX_VIDEO_FRAME_T* pstFrame1, const AX_VIDEO_FRAM
                           SAMPLE_MODEL_OUTPUT_T* pstOutput);
 
 AX_S32 sample_npu_deinit(AX_VOID);
+
+/* Release the per-frame host output buffer produced by sample_run_axmodel. */
+void sample_engine_release_output(SAMPLE_MODEL_OUTPUT_T* pstOutput);
 
 #ifdef __cplusplus
 }

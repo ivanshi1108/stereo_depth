@@ -18,6 +18,9 @@ public:
 
     bool isActive() const { return m_active; }
 
+    // True once the user has closed the preview window (so the app can exit).
+    bool isWindowClosed() const;
+
 private:
     struct Impl;
     Impl* m_impl = nullptr;

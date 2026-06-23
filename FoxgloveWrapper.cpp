@@ -48,7 +48,9 @@ bool FoxgloveWrapper::start(const Options& options) {
     ws_options.host = options.host;
     ws_options.port = options.port;
     ws_options.supported_encodings = {"json"};
-    ws_options.message_backlog_size = options.message_backlog_size;
+    // This Foxglove SDK build does not expose a per-client message backlog size
+    // option; the -q value is kept for app-side bookkeeping only.
+    (void)options.message_backlog_size;
 
     ws_options.callbacks.onSubscribe = [this](uint64_t channel_id,
                                               const foxglove::ClientMetadata& client) {

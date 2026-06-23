@@ -1,82 +1,85 @@
-# Stereo Depth 示例
+# Stereo Depth 示例（AXCL版本）
 
-## 板上编译
+## 架构设计
+![系统架构](res/pipeline.png)
+
+## 已验证平台
+
+| 硬件平台 | 操作系统 |
+| --- | --- |
+| Raspberry Pi 5 | Debian GNU/Linux 13 (trixie) |
+| AMD64 PC | Ubuntu 22.04.4 LTS |
+
+## 支持的模组
+
+- ZED Mini Stereo Camera
+
+## 编译
+
+### 安装依赖
+
+```bash
+sudo apt update
+sudo apt install -y build-essential cmake pkg-config \
+    libopencv-dev libavcodec-dev libavutil-dev libswscale-dev libcurl4-openssl-dev
+```
+
+请确认已安装 AXCL 驱动 ，并用 `axcl-smi` 确认算力卡工作正常。
+
+### 构建
 
 在工程根目录执行：
 
 ```bash
-cd /root/stereo_depth
 make clean
 make build
 make install
 ```
 
-编译输出目录：
-
-- `build/`
-
-安装输出目录：
-
-- `output/sample_stereo_depth/`
+- 编译输出：`build/`
+- 安装输出：`output/sample_stereo_depth/`
 
 ## 运行
 
-安装后的目录结构如下：
+安装后目录结构：
 
 ```text
 output/sample_stereo_depth/
 ├── sample_stereo_depth
-├── dsp/
 ├── lib/
 └── models/
 ```
 
-运行时需要把安装目录里的 `lib/` 和平台库目录 `/soc/lib` 加进 `LD_LIBRARY_PATH`。
-
-### 默认运行
+### 默认运行（UVC 采集 + 预览窗口 + foxglove 发布）
 
 ```bash
-cd /root/stereo_depth/output/sample_stereo_depth
-LD_LIBRARY_PATH="$PWD/lib:/soc/lib:$LD_LIBRARY_PATH" ./sample_stereo_depth
-```
-
-### 开启 HDMI VO 预览
-
-```bash
-cd /root/stereo_depth/output/sample_stereo_depth
-LD_LIBRARY_PATH="$PWD/lib:/soc/lib:$LD_LIBRARY_PATH" ./sample_stereo_depth --vo
+cd output/sample_stereo_depth
+./sample_stereo_depth
 ```
 
 ### 回放 MCAP 文件
 
 ```bash
-cd /root/stereo_depth/output/sample_stereo_depth
-LD_LIBRARY_PATH="$PWD/lib:/soc/lib:$LD_LIBRARY_PATH" \
-./sample_stereo_depth --vo -i /root/your_dump.mcap
+./sample_stereo_depth -i /path/to/your_dump.mcap
+./sample_stereo_depth -i /path/to/your_dump.mcap --mcap-stream h264 # 回放录制里的 H.264 流
 ```
 
-### 只检查可支持的 UVC 模式
+### 不开预览窗口（无桌面预览，仅 foxglove 发布）
 
 ```bash
-cd /root/stereo_depth/output/sample_stereo_depth
-LD_LIBRARY_PATH="$PWD/lib:/soc/lib:$LD_LIBRARY_PATH" ./sample_stereo_depth -l
+./sample_stereo_depth --no-vo -i /path/to/your_dump.mcap
 ```
+
+### --imgproc参数说明
+- `--imgproc <host|axcl|auto>`：图像处理后端，**默认 `auto`**。
+- `auto` / `axcl`：优先用算力卡 IVPS 做图像处理，失败时自动回退HOST CPU。
+- `host`：全部用HOST CPU 执行图像处理。
 
 ## 常见说明
-
-- 默认 NPU 模型会优先从安装目录下的 `models/axstereo_pro.axmodel` 加载。
-- 默认 DSP 固件会优先从安装目录下的 `dsp/` 加载。
-- 如果板子当前没有可用的动态标定文件或默认 mesh，可以先用 `-g off` 排除 GDC 问题。
-
-例如：
-
-```bash
-cd /root/stereo_depth/output/sample_stereo_depth
-LD_LIBRARY_PATH="$PWD/lib:/soc/lib:$LD_LIBRARY_PATH" \
-./sample_stereo_depth -g off --vo -i /root/your_dump.mcap
-```
+- 默认 NPU 模型从安装目录 `models/axstereo_pro.axmodel` 加载。
+- 运行前会检查 AXCL host 驱动（`/dev/axcl_host`）与 `axcl-smi`，不满足则拒绝运行。
+- 点云仅在 `/camera/pointcloud` 有订阅或正在录制时才计算，以节省 CPU。
 
 ## 详细说明
 
-- 更完整的运行参数、输入格式、Foxglove、MCAP、VO、GDC、录制与性能说明，请看 [`README_CN.md`](README_CN.md)。
-
+- 更完整的运行参数，请参阅 https://zhuanlan.zhihu.com/p/2047786127969477270。

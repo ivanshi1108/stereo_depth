@@ -25,11 +25,7 @@ extern "C" {
 typedef AX_VOID* AX_STEREO_HANDLE;
 typedef AX_VOID* AX_STEREO_FRAME_CTX;
 
-typedef enum {
-    AX_STEREO_ENGINE_NPU = 0,
-    AX_STEREO_ENGINE_DSP = 1,
-    AX_STEREO_ENGINE_BUTT
-} AX_STEREO_ENGINE_E;
+typedef enum { AX_STEREO_ENGINE_NPU = 0, AX_STEREO_ENGINE_BUTT } AX_STEREO_ENGINE_E;
 
 typedef enum {
     AX_STEREO_GDC_MESH_DEFAULT = 0,
@@ -48,7 +44,6 @@ typedef struct axSTEREO_ATTR_T {
     AX_STEREO_ENGINE_E eEngine;             /* RW; Inference engine type. */
     AX_BOOL bEnableGdc;                     /* RW; Enable GDC dewarp. */
     AX_STEREO_GDC_MESH_MODE_E eGdcMeshMode; /* RW; GDC mesh mode. */
-    AX_BOOL bDspDualCore;                   /* RW; Enable DSP dual-core SGBM. */
     AX_BOOL bExportVoFrames;                /* RW; Export NV12 frames for VO display. */
     AX_CHAR szNpuModelPath[256];            /* RW; NPU model file path. */
     AX_CHAR szCameraSerialNumber[128];      /* RW; Camera serial number for calibration. */
@@ -189,6 +184,18 @@ AX_S32 AX_STEREO_ReleaseOutput(AX_STEREO_OUTPUT_T* pOutput);
  *   Return: baseline distance in meters.
  */
 AX_F32 AX_STEREO_GetBaselineMeters(AX_STEREO_HANDLE hPipeline);
+
+/*
+ * AX_STEREO_SetComputePointCloud
+ *   Enable/disable the CPU-heavy point cloud generation at runtime. When
+ *   disabled, the postprocess stage leaves the point cloud output empty.
+ *
+ *   hPipeline [in]: pipeline handle.
+ *   bEnable   [in]: AX_TRUE to compute the point cloud, AX_FALSE to skip it.
+ *
+ *   Return: 0 on success, non-zero on error.
+ */
+AX_S32 AX_STEREO_SetComputePointCloud(AX_STEREO_HANDLE hPipeline, AX_BOOL bEnable);
 
 /*
  * AX_STEREO_GetEngine

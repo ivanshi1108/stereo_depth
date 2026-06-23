@@ -19,19 +19,15 @@
 #include <mutex>
 #include <opencv2/calib3d.hpp>
 #include <opencv2/core.hpp>
+#include <opencv2/imgproc.hpp>
 #include <optional>
 #include <queue>
 #include <sstream>
 #include <thread>
 
-#include "ax_dsp_api.h"
-#include "ax_dsp_cv_api.h"
-#include "ax_engine_api.h"
-#include "ax_ivps_api.h"
-#include "ax_sys_api.h"
-#include "sample_dsp.h"
+#include "AxclImageProc.hpp"
+#include "ImageProcBackend.hpp"
 #include "sample_engine.h"
-#include "sample_gdc.h"
 #include "sample_image.h"
 
 #define SAMPLE_LOG_TAG "PIPELINE"
@@ -43,8 +39,6 @@ const char* inferenceEngineName(InferenceEngine engine) {
     switch (engine) {
         case InferenceEngine::NPU:
             return "npu";
-        case InferenceEngine::DSP:
-            return "dsp";
         default:
             return "unknown";
     }
@@ -60,45 +54,6 @@ std::filesystem::path executableAdjacentPath(const char* childName) {
         return {};
     }
     return executablePath.parent_path() / childName;
-}
-
-std::filesystem::path dspRuntimeDirectoryPath() {
-    static const std::filesystem::path resolvedPath = []() {
-        std::error_code ec;
-
-        if (const char* envPath = std::getenv("STEREO_DEPTH_DSP_DIR");
-            envPath != nullptr && envPath[0] != '\0') {
-            const std::filesystem::path candidate(envPath);
-            if (std::filesystem::exists(candidate / "itcm.bin", ec) && !ec) {
-                return candidate;
-            }
-        }
-
-        const std::filesystem::path candidate = executableAdjacentPath("dsp");
-        if (!candidate.empty()) {
-            if (std::filesystem::exists(candidate / "itcm.bin", ec) && !ec) {
-                return candidate;
-            }
-        }
-
-        {
-            const std::filesystem::path candidate(STEREO_DEPTH_APP_DSP_DIR);
-            if (std::filesystem::exists(candidate / "itcm.bin", ec) && !ec) {
-                return candidate;
-            }
-        }
-
-        {
-            const std::filesystem::path candidate("/opt/data/dsp");
-            if (std::filesystem::exists(candidate / "itcm.bin", ec) && !ec) {
-                return candidate;
-            }
-        }
-
-        return std::filesystem::path(STEREO_DEPTH_APP_DSP_DIR);
-    }();
-
-    return resolvedPath;
 }
 
 const std::string& defaultNpuModelPathString() {
@@ -286,8 +241,6 @@ ThreadPool& getPostProcessThreadPool() {
     return pool;
 }
 
-constexpr AX_DSP_ID_E DSP_ID = AX_DSP_ID_0;
-constexpr AX_DSP_ID_E DSP_SECONDARY_ID = AX_DSP_ID_1;
 constexpr AX_S32 PIPE_NUM = 2;
 constexpr AX_S32 SGBM_DUAL_CORE_OVERLAP_ROWS = 16;
 constexpr AX_F32 SGBM_DISPARITY_SCALE = 16.0f;
@@ -311,13 +264,108 @@ typedef struct {
     AX_U8 b;
 } Point3D_ARGB;
 
-typedef struct {
-    bool initialized;
-    AX_S32 initedCount;
-    SAMPLE_RESOURCE_T gdcResource;
-} PipelineGdcContext;
+// Host GDC: the board dewarped each eye with the IVPS GDC block driven by a
+// hardware mesh. On the host the same fisheye rectification is rebuilt from the
+// calibration INI as OpenCV remap tables and applied on the CPU.
+struct HostGdcMaps {
+    bool attempted = false;
+    bool ready = false;
+    cv::Mat mapX[PIPE_NUM];  // kDewarpImageHeight x kDewarpImageWidth, CV_32FC1
+    cv::Mat mapY[PIPE_NUM];
+    cv::Mat uvMapX[PIPE_NUM];  // half size for the NV12 chroma plane
+    cv::Mat uvMapY[PIPE_NUM];
+    float baselineMeters = 0.0f;
+};
 
-PipelineGdcContext gPipelineGdcCtx = {false, 0, {0}};
+HostGdcMaps gHostGdc;
+
+void resetHostGdcMaps() { gHostGdc = HostGdcMaps(); }
+
+// Fill gHostGdc from the four per-eye remap vectors (left/right X/Y).
+void finalizeHostGdcMaps(std::vector<float>& lx, std::vector<float>& ly, std::vector<float>& rx,
+                         std::vector<float>& ry, float baseline) {
+    const int w = kDewarpImageWidth;
+    const int h = kDewarpImageHeight;
+    auto toMat = [&](std::vector<float>& v) { return cv::Mat(h, w, CV_32FC1, v.data()).clone(); };
+    gHostGdc.mapX[0] = toMat(lx);
+    gHostGdc.mapY[0] = toMat(ly);
+    gHostGdc.mapX[1] = toMat(rx);
+    gHostGdc.mapY[1] = toMat(ry);
+    for (int eye = 0; eye < PIPE_NUM; ++eye) {
+        cv::resize(gHostGdc.mapX[eye], gHostGdc.uvMapX[eye], cv::Size(w / 2, h / 2), 0, 0,
+                   cv::INTER_NEAREST);
+        cv::resize(gHostGdc.mapY[eye], gHostGdc.uvMapY[eye], cv::Size(w / 2, h / 2), 0, 0,
+                   cv::INTER_NEAREST);
+        gHostGdc.uvMapX[eye] *= 0.5f;
+        gHostGdc.uvMapY[eye] *= 0.5f;
+    }
+    gHostGdc.baselineMeters = baseline;
+    gHostGdc.ready = true;
+}
+
+bool ensureHostGdcMaps(const std::string& serialNumber, int inputWidth, int inputHeight) {
+    if (gHostGdc.attempted) {
+        return gHostGdc.ready;
+    }
+    gHostGdc.attempted = true;
+
+    std::vector<float> lx;
+    std::vector<float> ly;
+    std::vector<float> rx;
+    std::vector<float> ry;
+    float baseline = 0.0f;
+    if (!buildHostRectifyMaps(serialNumber, static_cast<uint32_t>(inputWidth),
+                              static_cast<uint32_t>(inputHeight), lx, ly, rx, ry, baseline)) {
+        return false;
+    }
+    finalizeHostGdcMaps(lx, ly, rx, ry, baseline);
+    return true;
+}
+
+// Build the host remap tables directly from GDC mesh .txt files (used with the
+// generic default mesh, when no calibration INI is available).
+bool ensureHostGdcMapsFromMesh(const std::string& leftMeshPath, const std::string& rightMeshPath,
+                               float baselineMeters) {
+    if (gHostGdc.attempted) {
+        return gHostGdc.ready;
+    }
+    gHostGdc.attempted = true;
+
+    std::vector<float> lx;
+    std::vector<float> ly;
+    std::vector<float> rx;
+    std::vector<float> ry;
+    if (!buildHostRectifyMapsFromMesh(leftMeshPath, rightMeshPath, lx, ly, rx, ry)) {
+        return false;
+    }
+    finalizeHostGdcMaps(lx, ly, rx, ry, baselineMeters);
+    return true;
+}
+
+// Dewarp one eye: src is a (strided) NV12 half-frame, dst a contiguous NV12
+// kDewarpImageWidth x kDewarpImageHeight frame.
+int hostGdcDewarpEye(int eye, const AX_VIDEO_FRAME_T* src, AX_VIDEO_FRAME_T* dst) {
+    if (eye < 0 || eye >= PIPE_NUM || !gHostGdc.ready) {
+        return -1;
+    }
+    const int inW = static_cast<int>(src->u32Width);
+    const int inH = static_cast<int>(src->u32Height);
+    const int inStride = static_cast<int>(src->u32PicStride[0]);
+    const int outStride = static_cast<int>(dst->u32PicStride[0]);
+
+    cv::Mat yIn(inH, inW, CV_8UC1, reinterpret_cast<void*>(src->u64VirAddr[0]), inStride);
+    cv::Mat uvIn(inH / 2, inW / 2, CV_8UC2, reinterpret_cast<void*>(src->u64VirAddr[1]), inStride);
+    cv::Mat yOut(static_cast<int>(dst->u32Height), static_cast<int>(dst->u32Width), CV_8UC1,
+                 reinterpret_cast<void*>(dst->u64VirAddr[0]), outStride);
+    cv::Mat uvOut(static_cast<int>(dst->u32Height) / 2, static_cast<int>(dst->u32Width) / 2,
+                  CV_8UC2, reinterpret_cast<void*>(dst->u64VirAddr[1]), outStride);
+
+    cv::remap(yIn, yOut, gHostGdc.mapX[eye], gHostGdc.mapY[eye], cv::INTER_LINEAR,
+              cv::BORDER_CONSTANT);
+    cv::remap(uvIn, uvOut, gHostGdc.uvMapX[eye], gHostGdc.uvMapY[eye], cv::INTER_LINEAR,
+              cv::BORDER_CONSTANT);
+    return 0;
+}
 
 bool isNonEmptyFile(const std::string& path) {
     std::error_code ec;
@@ -325,65 +373,6 @@ bool isNonEmptyFile(const std::string& path) {
         return false;
     }
     return std::filesystem::file_size(path, ec) > 0 && !ec;
-}
-
-AX_S32 ensureGdcInitialized(SAMPLE_RESOURCE_T* stResource, const std::string& leftMeshPath,
-                            const std::string& rightMeshPath,
-                            const AX_VIDEO_FRAME_T& leftSourceFrame,
-                            const AX_VIDEO_FRAME_T& rightSourceFrame) {
-    if (gPipelineGdcCtx.initialized) {
-        for (AX_S32 idx = 0; idx < gPipelineGdcCtx.initedCount; ++idx) {
-            stResource->gdcHandle[idx] = gPipelineGdcCtx.gdcResource.gdcHandle[idx];
-        }
-        return 0;
-    }
-
-    AX_CHAR* pModelFile[PIPE_NUM] = {const_cast<AX_CHAR*>(leftMeshPath.c_str()),
-                                     const_cast<AX_CHAR*>(rightMeshPath.c_str())};
-    const AX_VIDEO_FRAME_T* sourceFrames[PIPE_NUM] = {&leftSourceFrame, &rightSourceFrame};
-
-    AX_S32 ret = 0;
-    AX_S32 gdcInitedCount = 0;
-    for (AX_S32 idx = 0; idx < PIPE_NUM; idx++) {
-        ret = sample_gdc_init(pModelFile[idx], sourceFrames[idx], &stResource->dewarpFrame[idx],
-                              &stResource->gdcHandle[idx], &stResource->meshPhyAddr[idx],
-                              &stResource->meshVirAddr[idx]);
-        if (ret) {
-            ALOGE("sample_gdc_init:%d fail, ret %d!", idx, ret);
-            break;
-        }
-        gdcInitedCount++;
-    }
-
-    if (ret) {
-        for (AX_S32 idx = 0; idx < gdcInitedCount; idx++) {
-            sample_gdc_deinit(stResource, idx);
-        }
-        return ret;
-    }
-
-    gPipelineGdcCtx.initedCount = gdcInitedCount;
-    for (AX_S32 idx = 0; idx < gdcInitedCount; ++idx) {
-        gPipelineGdcCtx.gdcResource.gdcHandle[idx] = stResource->gdcHandle[idx];
-        gPipelineGdcCtx.gdcResource.meshPhyAddr[idx] = stResource->meshPhyAddr[idx];
-        gPipelineGdcCtx.gdcResource.meshVirAddr[idx] = stResource->meshVirAddr[idx];
-    }
-    gPipelineGdcCtx.initialized = true;
-
-    return 0;
-}
-
-void deinitGdcIfNeeded() {
-    if (!gPipelineGdcCtx.initialized) {
-        return;
-    }
-
-    for (AX_S32 idx = 0; idx < gPipelineGdcCtx.initedCount; idx++) {
-        sample_gdc_deinit(&gPipelineGdcCtx.gdcResource, idx);
-    }
-    gPipelineGdcCtx.initialized = false;
-    gPipelineGdcCtx.initedCount = 0;
-    std::memset(&gPipelineGdcCtx.gdcResource, 0, sizeof(gPipelineGdcCtx.gdcResource));
 }
 
 void disparityToPointCloudArgb(const AX_F32* disparityBuf, const AX_U8* bgrBuf, AX_S32 width,
@@ -547,14 +536,11 @@ void releaseFrameContextInternal(StereoDepthPipeline::FrameContext& context);
 struct StereoDepthPipeline::FrameContext {
     SAMPLE_RESOURCE_T stResource = {0};
     SAMPLE_MODEL_OUTPUT_T stOutput = {0};
-    SAMPLE_DSP_SGBM_CTX_T dspSgbmCtx = {0};
     bool frameCreated = false;
-    bool dspSgbmPrepared = false;
     bool gdcApplied = false;
     bool borrowedCscFrame = false;
     AX_VIDEO_FRAME_T ownedCscFrame = {};
     PipelineOutput output;
-    std::vector<AX_F32> dspDisparityFloat;
     std::shared_ptr<void> inputFrameOwner;
 
     FrameContext() { stOutput.blockId = AX_INVALID_BLOCKID; }
@@ -564,14 +550,8 @@ struct StereoDepthPipeline::FrameContext {
 namespace {
 
 void releaseFrameContextInternal(StereoDepthPipeline::FrameContext& context) {
-    if (context.stOutput.blockId != AX_INVALID_BLOCKID) {
-        AX_POOL_ReleaseBlock(context.stOutput.blockId);
-        context.stOutput.blockId = AX_INVALID_BLOCKID;
-    }
-    if (context.dspSgbmPrepared) {
-        sample_dsp_sgbm_release(&context.dspSgbmCtx);
-        context.dspSgbmPrepared = false;
-    }
+    // The NPU output now lives in a host buffer owned by this context.
+    sample_engine_release_output(&context.stOutput);
     if (context.borrowedCscFrame) {
         context.stResource.cscFrame = context.ownedCscFrame;
         std::memset(&context.ownedCscFrame, 0, sizeof(context.ownedCscFrame));
@@ -593,16 +573,13 @@ const char* defaultNpuModelPath() { return defaultNpuModelPathString().c_str(); 
 StereoDepthPipeline::~StereoDepthPipeline() { shutdown(); }
 
 int StereoDepthPipeline::initialize(InferenceEngine engine, bool enableGdc, GdcMeshMode gdcMeshMode,
-                                    bool dspDualCore, bool exportVoFrames,
-                                    const std::string& npuModelPath,
+                                    bool exportVoFrames, const std::string& npuModelPath,
                                     const std::string& cameraSerialNumber, int inputWidth,
                                     int inputHeight) {
     m_inferenceEngine = engine;
     m_enableGdc = enableGdc;
     m_exportVoFrames = exportVoFrames;
     m_gdcMeshMode = gdcMeshMode;
-    m_dspDualCoreRequested = dspDualCore;
-    m_dspDualCoreEnabled = false;
     m_inputWidth = inputWidth;
     m_inputHeight = inputHeight;
     m_meshLeftPath = "/opt/data/npu_disp/mesh_left.txt";
@@ -620,151 +597,133 @@ int StereoDepthPipeline::initialize(InferenceEngine engine, bool enableGdc, GdcM
         return -1;
     }
 
+    // Resolve the GDC mesh: prefer the per-camera dynamic mesh (serial INI),
+    // otherwise fall back to the generic default mesh shipped under models/.
+    bool meshReady = false;
+    bool usingDefaultMesh = false;
+    std::string defaultMeshLeft;
+    std::string defaultMeshRight;
+    const bool haveDefaultMesh = resolveDefaultMeshPaths(static_cast<uint32_t>(m_inputWidth),
+                                                         static_cast<uint32_t>(m_inputHeight),
+                                                         defaultMeshLeft, defaultMeshRight);
+
     if (m_enableGdc) {
-        if (m_gdcMeshMode == GdcMeshMode::Default) {
-            ALOGN("GDC uses default mesh files: %s, %s", m_meshLeftPath.c_str(),
-                  m_meshRightPath.c_str());
-        } else {
-            if (cameraSerialNumber.empty()) {
+        if (m_gdcMeshMode != GdcMeshMode::Default && !cameraSerialNumber.empty()) {
+            const std::string cachedCalibrationIniPath = calibrationIniPath(cameraSerialNumber);
+            ALOGN("Dynamic calibration runtime directory: %s",
+                  calibrationRuntimeDirectory().c_str());
+            bool iniReady = false;
+            if (isNonEmptyFile(cachedCalibrationIniPath)) {
+                ALOGN("Calibration INI exists, reuse: %s", cachedCalibrationIniPath.c_str());
+                iniReady = true;
+            } else if (downloadCalibrationFile(cameraSerialNumber) == 0) {
+                iniReady = true;
+            } else {
+                ALOGW("calibration INI missing and download failed: serial=%s",
+                      cameraSerialNumber.c_str());
+            }
+            if (iniReady &&
+                generateMeshFiles(cameraSerialNumber, m_gdcMeshMode == GdcMeshMode::DynamicForce,
+                                  m_meshLeftPath, m_meshRightPath,
+                                  static_cast<uint32_t>(m_inputWidth),
+                                  static_cast<uint32_t>(m_inputHeight)) == 0) {
+                meshReady = true;
+            } else {
                 ALOGW(
-                    "dynamic mesh requested but camera serial number is empty, fallback to "
-                    "built-in mesh");
-                m_gdcMeshMode = GdcMeshMode::Default;
-                ALOGN("GDC fallback to default mesh files: %s, %s", m_meshLeftPath.c_str(),
+                    "dynamic mesh unavailable, falling back to default mesh: serial=%s "
+                    "input=%dx%d",
+                    cameraSerialNumber.c_str(), m_inputWidth, m_inputHeight);
+            }
+        }
+
+        if (!meshReady) {
+            // No serial number, builtin mesh mode, or dynamic generation failed:
+            // use the generic default mesh table shipped under models/.
+            m_cameraBaselineMeters = CAM_B;
+            if (haveDefaultMesh) {
+                m_meshLeftPath = defaultMeshLeft;
+                m_meshRightPath = defaultMeshRight;
+                meshReady = true;
+                usingDefaultMesh = true;
+                ALOGN("GDC uses default mesh files: %s, %s", m_meshLeftPath.c_str(),
                       m_meshRightPath.c_str());
             } else {
-                const std::string cachedCalibrationIniPath = calibrationIniPath(cameraSerialNumber);
-
-                ALOGN("Dynamic calibration runtime directory: %s",
-                      calibrationRuntimeDirectory().c_str());
-
-                if (isNonEmptyFile(cachedCalibrationIniPath)) {
-                    ALOGN("Calibration INI exists, reuse: %s", cachedCalibrationIniPath.c_str());
-                } else {
-                    ret = downloadCalibrationFile(cameraSerialNumber);
-                    if (ret != 0) {
-                        ALOGW(
-                            "calibration INI missing and download failed, fallback to default "
-                            "mesh: serial=%s",
-                            cameraSerialNumber.c_str());
-                        m_gdcMeshMode = GdcMeshMode::Default;
-                        ALOGN("GDC fallback to default mesh files: %s, %s", m_meshLeftPath.c_str(),
-                              m_meshRightPath.c_str());
-                    }
-                }
-            }
-
-            if (m_gdcMeshMode != GdcMeshMode::Default) {
-                ret = generateMeshFiles(cameraSerialNumber,
-                                        m_gdcMeshMode == GdcMeshMode::DynamicForce, m_meshLeftPath,
-                                        m_meshRightPath, static_cast<uint32_t>(m_inputWidth),
-                                        static_cast<uint32_t>(m_inputHeight));
-                if (ret != 0) {
-                    ALOGW(
-                        "dynamic mesh generation failed, fallback to default mesh: serial=%s "
-                        "input=%dx%d",
-                        cameraSerialNumber.c_str(), m_inputWidth, m_inputHeight);
-                    m_gdcMeshMode = GdcMeshMode::Default;
-                    m_meshLeftPath = "/opt/data/npu_disp/mesh_left.txt";
-                    m_meshRightPath = "/opt/data/npu_disp/mesh_right.txt";
-                    m_cameraBaselineMeters = CAM_B;
-                    ALOGN("GDC fallback to default mesh files: %s, %s", m_meshLeftPath.c_str(),
-                          m_meshRightPath.c_str());
-                }
+                ALOGW(
+                    "no default mesh found for %dx%d under models/ (mesh_<res>_l/r_32x16.txt); "
+                    "GDC will fall back to resize",
+                    m_inputWidth, m_inputHeight);
             }
         }
     }
 
     AX_F32 calibrationBaselineMeters = 0.0f;
-    if (m_enableGdc && m_gdcMeshMode != GdcMeshMode::Default &&
+    if (m_enableGdc && !usingDefaultMesh &&
         tryLoadCalibrationBaselineMeters(cameraSerialNumber, calibrationBaselineMeters)) {
         m_cameraBaselineMeters = calibrationBaselineMeters;
         ALOGN("use calibration baseline: serial=%s baseline=%.6f m", cameraSerialNumber.c_str(),
               m_cameraBaselineMeters);
     }
 
-    ret = AX_SYS_Init();
-    if (ret != 0) {
-        ALOGE("AX_SYS_Init error %x", ret);
-        return ret;
+    // Host/AXCL port: there is no on-chip SYS/IVPS/DSP to bring up here. Image
+    // pre/post-processing runs on the host CPU (OpenCV) and the NPU runs on the
+    // Axera card via AXCL, which is initialized inside sample_npu_init().
+    if (m_inferenceEngine != InferenceEngine::NPU) {
+        ALOGE("unsupported inference engine for host/AXCL port");
+        return -1;
     }
-    m_sysInited = true;
 
-    ret = AX_IVPS_Init();
-    if (ret != 0) {
-        ALOGE("AX_IVPS_Init error %x", ret);
-        return ret;
-    }
-    m_ivpsInited = true;
-
-    const std::filesystem::path dspRuntimeDir = dspRuntimeDirectoryPath();
-    const std::string itcmPath = (dspRuntimeDir / "itcm.bin").string();
-    const std::string sramPath = (dspRuntimeDir / "sram.bin").string();
-    const std::string dtcmPath = (dspRuntimeDir / "dtcm.bin").string();
-    const std::string dtcm2Path = (dspRuntimeDir / "dtcm2.bin").string();
-
-    /* Always init both DSP cores (core 0 for SGBM/FGS, core 1 for SGBM/CSC) */
-    ret = SAMPLE_DSP_Init(DSP_ID, const_cast<char*>(itcmPath.c_str()),
-                          const_cast<char*>(sramPath.c_str()), const_cast<char*>(dtcmPath.c_str()),
-                          const_cast<char*>(dtcm2Path.c_str()));
-    if (ret != AX_DSP_SUCCESS) {
-        ALOGE("AX DSP%d Init error %x", DSP_ID, ret);
-        return ret;
-    }
-    m_dspInited = true;
-
-    ret = SAMPLE_DSP_Init(DSP_SECONDARY_ID, const_cast<char*>(itcmPath.c_str()),
-                          const_cast<char*>(sramPath.c_str()), const_cast<char*>(dtcmPath.c_str()),
-                          const_cast<char*>(dtcm2Path.c_str()));
-    if (ret != AX_DSP_SUCCESS) {
-        ALOGE("AX DSP%d Init error %x", DSP_SECONDARY_ID, ret);
-        return ret;
-    }
-    m_dspInitedSecondary = true;
-
-    ret = AX_DSP_CV_Init(DSP_ID);
-    if (ret != 0) {
-        ALOGE("AX_DSP_CV_Init(%d) fail, ret=0x%x", DSP_ID, ret);
-        return ret;
-    }
-    m_dspCvInited = true;
-
-    ret = AX_DSP_CV_Init(DSP_SECONDARY_ID);
-    if (ret != 0) {
-        ALOGE("AX_DSP_CV_Init(%d) fail, ret=0x%x", DSP_SECONDARY_ID, ret);
-        return ret;
-    }
-    m_dspCvInitedSecondary = true;
-
-    if (m_inferenceEngine == InferenceEngine::DSP) {
-        m_dspDualCoreEnabled = m_dspDualCoreRequested;
-    } else {
-        const std::string resolvedModelPath =
-            npuModelPath.empty() ? defaultNpuModelPathString() : npuModelPath;
-        const char* modelPath = resolvedModelPath.c_str();
-        AX_ENGINE_NPU_ATTR_T attr;
-        std::memset(&attr, 0, sizeof(attr));
-        attr.eHardMode = AX_ENGINE_VIRTUAL_NPU_DISABLE;
-        ret = AX_ENGINE_Init(&attr);
-        if (ret != 0) {
-            ALOGE("AX_ENGINE_Init failed with code %d", ret);
-            return ret;
+    // Set up the GDC dewarp. Prefer the card (AXCL_IVPS_Dewarp) when the AXCL
+    // image-processing backend is active; otherwise build host OpenCV remap
+    // tables (from the calibration INI when available, else from the mesh .txt).
+    resetHostGdcMaps();
+    if (m_enableGdc && meshReady) {
+        bool axclDewarp = false;
+        if (stereo_depth::imageProcUsesAxcl()) {
+            if (host_backend::axclDewarpInit(m_meshLeftPath, m_meshRightPath, m_inputWidth / 2,
+                                             m_inputHeight, kDewarpImageWidth,
+                                             kDewarpImageHeight)) {
+                axclDewarp = true;
+                ALOGN("AXCL GDC dewarp enabled (AXCL_IVPS_Dewarp on the card)");
+            } else {
+                ALOGW("AXCL GDC dewarp init failed, falling back to host remap");
+            }
         }
-        m_engineInited = true;
-
-        ALOGN("Resolved NPU model path: %s", modelPath);
-
-        ret = sample_npu_init(modelPath);
-        if (ret != 0) {
-            ALOGE("sample_npu_init fail, ret %d, model=%s!", ret, modelPath);
-            return ret;
+        if (!axclDewarp) {
+            bool hostOk = false;
+            if (usingDefaultMesh) {
+                hostOk = ensureHostGdcMapsFromMesh(m_meshLeftPath, m_meshRightPath,
+                                                   m_cameraBaselineMeters);
+                if (hostOk) {
+                    ALOGN("host GDC dewarp enabled (OpenCV remap from default mesh)");
+                }
+            } else {
+                hostOk = ensureHostGdcMaps(cameraSerialNumber, m_inputWidth, m_inputHeight);
+                if (hostOk) {
+                    if (gHostGdc.baselineMeters > 0.0f) {
+                        m_cameraBaselineMeters = gHostGdc.baselineMeters;
+                    }
+                    ALOGN("host GDC dewarp enabled (OpenCV remap from calibration)");
+                }
+            }
+            if (!hostOk) {
+                ALOGW("host GDC maps unavailable, using stretched resize (try -g off to silence)");
+            }
         }
-        m_npuInited = true;
     }
 
-    ALOGN("StereoDepthPipeline initialized with engine=%s gdc=%s dsp_core=%s",
-          inferenceEngineName(m_inferenceEngine), m_enableGdc ? "on" : "off",
-          m_dspDualCoreEnabled ? "dual" : "single");
+    const std::string resolvedModelPath =
+        npuModelPath.empty() ? defaultNpuModelPathString() : npuModelPath;
+    ALOGN("Resolved NPU model path: %s", resolvedModelPath.c_str());
+
+    ret = sample_npu_init(resolvedModelPath.c_str());
+    if (ret != 0) {
+        ALOGE("sample_npu_init fail, ret %d, model=%s!", ret, resolvedModelPath.c_str());
+        return ret;
+    }
+    m_npuInited = true;
+
+    ALOGN("StereoDepthPipeline initialized with engine=%s gdc=%s (host/AXCL)",
+          inferenceEngineName(m_inferenceEngine), m_enableGdc ? "on" : "off");
 
     return 0;
 }
@@ -796,37 +755,36 @@ int StereoDepthPipeline::preprocessPreparedNv12(FrameContextPtr& context) {
     AX_VIDEO_FRAME_T* stereoLeftFrame = &frameContext.stResource.resizeFrame[0];
     AX_VIDEO_FRAME_T* stereoRightFrame = &frameContext.stResource.resizeFrame[1];
 
-    if (m_enableGdc) {
-        ret = ensureGdcInitialized(&frameContext.stResource, m_meshLeftPath, m_meshRightPath,
-                                   frameLeft, frameRight);
-        if (ret) {
-            releaseFrameContextInternal(frameContext);
-            context.reset();
-            return ret;
+    bool gdcDone = false;
+    // Prefer the card-side dewarp (AXCL_IVPS_Dewarp) when --imgproc axcl made it
+    // available; otherwise use the host OpenCV remap.
+    if (m_enableGdc && host_backend::axclDewarpReady()) {
+        if (host_backend::axclDewarpEye(0, &frameLeft, &frameContext.stResource.dewarpFrame[0]) &&
+            host_backend::axclDewarpEye(1, &frameRight, &frameContext.stResource.dewarpFrame[1])) {
+            stereoLeftFrame = &frameContext.stResource.dewarpFrame[0];
+            stereoRightFrame = &frameContext.stResource.dewarpFrame[1];
+            frameContext.gdcApplied = true;
+            gdcDone = true;
+        } else {
+            ALOGW("AXCL GDC dewarp failed, falling back to resize for this frame");
         }
+    }
 
-        ret = AX_IVPS_GdcWorkRun(frameContext.stResource.gdcHandle[0], &frameLeft,
-                                 &frameContext.stResource.dewarpFrame[0]);
-        if (ret) {
-            ALOGE("AX_IVPS_GdcWorkRun left FAILED! ret:0x%x", ret);
-            releaseFrameContextInternal(frameContext);
-            context.reset();
-            return ret;
+    if (!gdcDone && m_enableGdc && gHostGdc.ready) {
+        if (hostGdcDewarpEye(0, &frameLeft, &frameContext.stResource.dewarpFrame[0]) == 0 &&
+            hostGdcDewarpEye(1, &frameRight, &frameContext.stResource.dewarpFrame[1]) == 0) {
+            stereoLeftFrame = &frameContext.stResource.dewarpFrame[0];
+            stereoRightFrame = &frameContext.stResource.dewarpFrame[1];
+            frameContext.gdcApplied = true;
+            gdcDone = true;
+        } else {
+            ALOGW("host GDC dewarp failed, falling back to resize for this frame");
         }
+    }
 
-        ret = AX_IVPS_GdcWorkRun(frameContext.stResource.gdcHandle[1], &frameRight,
-                                 &frameContext.stResource.dewarpFrame[1]);
-        if (ret) {
-            ALOGE("AX_IVPS_GdcWorkRun right FAILED! ret:0x%x", ret);
-            releaseFrameContextInternal(frameContext);
-            context.reset();
-            return ret;
-        }
-
-        stereoLeftFrame = &frameContext.stResource.dewarpFrame[0];
-        stereoRightFrame = &frameContext.stResource.dewarpFrame[1];
-        frameContext.gdcApplied = true;
-    } else {
+    if (!gdcDone) {
+        // No GDC (either disabled or calibration maps unavailable): stretch each
+        // stereo half to the model input size.
         ret = sample_crop_resize(&frameLeft, &frameContext.stResource.resizeFrame[0]);
         if (ret) {
             ALOGE("sample_crop_resize left fail, ret %d!", ret);
@@ -857,17 +815,7 @@ int StereoDepthPipeline::preprocessPreparedNv12(FrameContextPtr& context) {
     std::memcpy(frameContext.output.rgbData.data(),
                 reinterpret_cast<void*>(frameContext.stResource.bgrFrame.u64VirAddr[0]), rgbSize);
 
-    if (m_inferenceEngine == InferenceEngine::DSP) {
-        ret = sample_dsp_sgbm_prepare(stereoLeftFrame, stereoRightFrame, &frameContext.dspSgbmCtx);
-        if (ret != 0) {
-            ALOGE("sample_dsp_sgbm_prepare fail, ret=%d", ret);
-            releaseFrameContextInternal(frameContext);
-            context.reset();
-            return ret;
-        }
-        frameContext.dspSgbmPrepared = true;
-    }
-
+    (void)stereoRightFrame;
     return 0;
 }
 
@@ -994,43 +942,15 @@ int StereoDepthPipeline::inferFrame(const FrameContextPtr& context) {
         return -1;
     }
 
-    if (m_inferenceEngine == InferenceEngine::NPU) {
-        const AX_VIDEO_FRAME_T* leftFrame = context->gdcApplied
-                                                ? &context->stResource.dewarpFrame[0]
-                                                : &context->stResource.resizeFrame[0];
-        const AX_VIDEO_FRAME_T* rightFrame = context->gdcApplied
-                                                 ? &context->stResource.dewarpFrame[1]
-                                                 : &context->stResource.resizeFrame[1];
-        AX_S32 ret = sample_run_axmodel(leftFrame, rightFrame, &context->stOutput);
-        if (ret) {
-            ALOGE("sample_run_axmodel fail, ret %d!", ret);
-            return ret;
-        }
-        return 0;
-    }
-
-    if (!context->dspSgbmPrepared) {
-        ALOGE("dsp sgbm context is not prepared");
-        return -1;
-    }
-
-    SAMPLE_DSP_SGBM_RUN_PARAM_T sgbmParam;
-    std::memset(&sgbmParam, 0, sizeof(sgbmParam));
-    sgbmParam.primaryDspId = DSP_ID;
-    sgbmParam.secondaryDspId = DSP_SECONDARY_ID;
-    sgbmParam.dualCore = m_dspDualCoreEnabled ? AX_TRUE : AX_FALSE;
-    sgbmParam.overlapRows = SGBM_DUAL_CORE_OVERLAP_ROWS;
-    sgbmParam.pSgbm = &context->dspSgbmCtx.sgbm;
-    sgbmParam.memPhyAddr = context->dspSgbmCtx.memPhyAddr;
-    sgbmParam.memVirAddr = context->dspSgbmCtx.memVirAddr;
-    sgbmParam.memSize = context->dspSgbmCtx.memSize;
-
-    AX_S32 ret = sample_run_sgbm(&sgbmParam);
-    if (ret != 0) {
-        ALOGE("sample_run_sgbm fail, ret=0x%x", ret);
+    const AX_VIDEO_FRAME_T* leftFrame = context->gdcApplied ? &context->stResource.dewarpFrame[0]
+                                                            : &context->stResource.resizeFrame[0];
+    const AX_VIDEO_FRAME_T* rightFrame = context->gdcApplied ? &context->stResource.dewarpFrame[1]
+                                                             : &context->stResource.resizeFrame[1];
+    AX_S32 ret = sample_run_axmodel(leftFrame, rightFrame, &context->stOutput);
+    if (ret) {
+        ALOGE("sample_run_axmodel fail, ret %d!", ret);
         return ret;
     }
-
     return 0;
 }
 
@@ -1065,7 +985,7 @@ int StereoDepthPipeline::postprocessFrame(FrameContextPtr& context, PipelineOutp
     AX_U32 disparityWidth = kDewarpImageWidth;
     AX_U32 disparityHeight = kDewarpImageHeight;
 
-    if (m_inferenceEngine == InferenceEngine::NPU) {
+    {
         copyAdjustedNpuDisparityImage(static_cast<const AX_F32*>(context->stOutput.virAddr),
                                       static_cast<AX_S32>(disparityWidth),
                                       static_cast<AX_S32>(disparityHeight), NPU_DISPARITY_OFFSET,
@@ -1087,22 +1007,6 @@ int StereoDepthPipeline::postprocessFrame(FrameContextPtr& context, PipelineOutp
         const auto depthEnd = std::chrono::steady_clock::now();
         depthUs = static_cast<uint64_t>(
             std::chrono::duration_cast<std::chrono::microseconds>(depthEnd - depthBegin).count());
-    } else {
-        disparityWidth = context->dspSgbmCtx.sgbm.imageLeft.width;
-        disparityHeight = context->dspSgbmCtx.sgbm.imageLeft.height;
-        const AX_U32 disparityPitch = context->dspSgbmCtx.sgbm.imageLeft.pitch;
-        const AX_U16* disparityU16Buf = context->dspSgbmCtx.sgbm.dispPostOut;
-
-        const auto depthBegin = std::chrono::steady_clock::now();
-        convertDisparityU16ToDepthAndFloat(disparityU16Buf, disparityWidth, disparityHeight,
-                                           disparityPitch, output.depthData,
-                                           context->dspDisparityFloat);
-        const auto depthEnd = std::chrono::steady_clock::now();
-        depthUs = static_cast<uint64_t>(
-            std::chrono::duration_cast<std::chrono::microseconds>(depthEnd - depthBegin).count());
-
-        disparityFloatBuf = context->dspDisparityFloat.data();
-        output.confidenceData.clear();
     }
 
     if (m_pointCloudScaleWidth != static_cast<int>(disparityWidth) ||
@@ -1127,14 +1031,23 @@ int StereoDepthPipeline::postprocessFrame(FrameContextPtr& context, PipelineOutp
                                        m_cameraBaselineMeters, Z_GRID_CELL_WIDTH,
                                        Z_GRID_CELL_HEIGHT, output.zGridAvgData);
 
-    const auto pointCloudBegin = std::chrono::steady_clock::now();
-    disparityToPointCloudArgb(disparityFloatBuf, bgrBuf, static_cast<AX_S32>(disparityWidth),
-                              static_cast<AX_S32>(disparityHeight), CAM_FX, m_cameraBaselineMeters,
-                              m_pointCloudXScale, m_pointCloudYScale, output.pointCloudData);
-    const auto pointCloudEnd = std::chrono::steady_clock::now();
-    pointCloudUs = static_cast<uint64_t>(
-        std::chrono::duration_cast<std::chrono::microseconds>(pointCloudEnd - pointCloudBegin)
-            .count());
+    // Point cloud generation is CPU-heavy; skip it entirely when no one
+    // subscribes to or records the point cloud (controlled via
+    // setComputePointCloud()).
+    if (m_computePointCloud.load(std::memory_order_relaxed)) {
+        const auto pointCloudBegin = std::chrono::steady_clock::now();
+        disparityToPointCloudArgb(disparityFloatBuf, bgrBuf, static_cast<AX_S32>(disparityWidth),
+                                  static_cast<AX_S32>(disparityHeight), CAM_FX,
+                                  m_cameraBaselineMeters, m_pointCloudXScale, m_pointCloudYScale,
+                                  output.pointCloudData);
+        const auto pointCloudEnd = std::chrono::steady_clock::now();
+        pointCloudUs = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(pointCloudEnd - pointCloudBegin)
+                .count());
+    } else {
+        output.pointCloudData.clear();
+        pointCloudUs = 0;
+    }
 
     if (stats != nullptr) {
         stats->depthUs = depthUs;
@@ -1152,42 +1065,12 @@ void StereoDepthPipeline::releaseFrameContext(FrameContextPtr& context) {
 }
 
 void StereoDepthPipeline::shutdown() {
-    deinitGdcIfNeeded();
-
-    sample_dsp_sgbm_deinit();
-    m_dspDualCoreEnabled = false;
+    resetHostGdcMaps();
+    host_backend::axclDewarpShutdown();
 
     if (m_npuInited) {
         sample_npu_deinit();
         m_npuInited = false;
-    }
-    if (m_engineInited) {
-        AX_ENGINE_Deinit();
-        m_engineInited = false;
-    }
-    if (m_dspCvInitedSecondary) {
-        AX_DSP_CV_Exit(DSP_SECONDARY_ID);
-        m_dspCvInitedSecondary = false;
-    }
-    if (m_dspCvInited) {
-        AX_DSP_CV_Exit(DSP_ID);
-        m_dspCvInited = false;
-    }
-    if (m_dspInited) {
-        SAMPLE_DSP_DeInit(DSP_ID);
-        m_dspInited = false;
-    }
-    if (m_dspInitedSecondary) {
-        SAMPLE_DSP_DeInit(DSP_SECONDARY_ID);
-        m_dspInitedSecondary = false;
-    }
-    if (m_ivpsInited) {
-        AX_IVPS_Deinit();
-        m_ivpsInited = false;
-    }
-    if (m_sysInited) {
-        AX_SYS_Deinit();
-        m_sysInited = false;
     }
 }
 

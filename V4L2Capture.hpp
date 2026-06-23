@@ -1,6 +1,7 @@
 #pragma once
 
 #include <linux/videodev2.h>
+#include <cstdint>
 #include <optional>
 #include <string>
 #include <vector>

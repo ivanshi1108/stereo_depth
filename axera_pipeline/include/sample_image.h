@@ -1,7 +1,7 @@
 #ifndef SAMPLE_IMAGE_H
 #define SAMPLE_IMAGE_H
 
-#include "ax_dsp_api.h"
+// Host/AXCL port: image pre/post processing runs on the host CPU via OpenCV.
 #include "sample_resource.h"
 
 #ifdef __cplusplus

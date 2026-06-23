@@ -1,5 +1,6 @@
 #pragma once
 
+#include "BackendSelect.hpp"
 #include "InputFrameFormat.hpp"
 #include "V4L2Capture.hpp"
 

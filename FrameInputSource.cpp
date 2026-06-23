@@ -1563,7 +1563,9 @@ bool FrameInputSource::loadNextImportedH264Frame(std::shared_ptr<const ImportedF
 
     const size_t maxAttempts = std::max<size_t>(m_importedFrames.size() * 2, 32);
     for (size_t attempt = 0; attempt < maxAttempts; ++attempt) {
-        if (!m_replayClockStarted) {
+        // Create/start the decoder once (after construction or a replay reset).
+        // Do not recreate it while skipping leading non-IDR access units.
+        if (!m_h264ReplayDecoder->isStarted()) {
             if (!m_h264ReplayDecoder->beginSequence(m_options.width, m_options.height, error)) {
                 return false;
             }

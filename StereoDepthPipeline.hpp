@@ -2,6 +2,7 @@
 
 #include "InputFrameFormat.hpp"
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -60,7 +61,31 @@ int generateMeshFiles(const std::string& serialNumber, bool forceRegenerate,
                       std::string& leftMeshPath, std::string& rightMeshPath,
                       uint32_t inputWidth = kInputImageWidth,
                       uint32_t inputHeight = kInputImageHeight);
+
+// Host/AXCL port: build per-eye CPU dewarp/rectify remap tables straight from
+// the calibration INI (the board did this on the GDC hardware via a mesh).
+// Each map has kDewarpImageWidth*kDewarpImageHeight entries holding the source
+// pixel coordinate in the per-eye image. Returns true when calibration data is
+// available and the maps were produced.
+bool buildHostRectifyMaps(const std::string& serialNumber, uint32_t inputWidth,
+                          uint32_t inputHeight, std::vector<float>& mapLeftX,
+                          std::vector<float>& mapLeftY, std::vector<float>& mapRightX,
+                          std::vector<float>& mapRightY, float& baselineMeters);
 bool tryLoadCalibrationBaselineMeters(const std::string& serialNumber, float& baselineMeters);
+
+// Resolve the generic (serial-independent) default GDC mesh files for the given
+// input resolution. These are shipped under models/ as mesh_<res>_l/r_32x16.txt
+// and used when no camera serial number is available or builtin mesh mode is
+// selected. Returns true and fills both paths when the files exist.
+bool resolveDefaultMeshPaths(uint32_t inputWidth, uint32_t inputHeight, std::string& leftMeshPath,
+                             std::string& rightMeshPath);
+
+// Build host (OpenCV) remap tables directly from GDC mesh .txt files (the same
+// 33x33 user mesh consumed by the card's dewarp). Used for the host CPU dewarp
+// path when only a default/serial mesh is available (no calibration INI).
+bool buildHostRectifyMapsFromMesh(const std::string& leftMeshPath, const std::string& rightMeshPath,
+                                  std::vector<float>& mapLeftX, std::vector<float>& mapLeftY,
+                                  std::vector<float>& mapRightX, std::vector<float>& mapRightY);
 
 class StereoDepthPipeline {
 public:
@@ -76,10 +101,9 @@ public:
     ~StereoDepthPipeline();
 
     int initialize(InferenceEngine engine = InferenceEngine::NPU, bool enableGdc = true,
-                   GdcMeshMode gdcMeshMode = GdcMeshMode::DynamicReuse, bool dspDualCore = true,
-                   bool exportVoFrames = false, const std::string& npuModelPath = "",
-                   const std::string& cameraSerialNumber = "", int inputWidth = kInputImageWidth,
-                   int inputHeight = kInputImageHeight);
+                   GdcMeshMode gdcMeshMode = GdcMeshMode::DynamicReuse, bool exportVoFrames = false,
+                   const std::string& npuModelPath = "", const std::string& cameraSerialNumber = "",
+                   int inputWidth = kInputImageWidth, int inputHeight = kInputImageHeight);
     void shutdown();
     int preprocessFrame(FrameContextPtr& context, const void* inputFrame, size_t inputFrameSize,
                         uint64_t frameTimestampNs = 0,
@@ -98,22 +122,23 @@ public:
     InferenceEngine inferenceEngine() const { return m_inferenceEngine; }
     float cameraBaselineMeters() const { return m_cameraBaselineMeters; }
 
+    // Enable/disable the (CPU-heavy) point cloud generation at runtime. When
+    // disabled, postprocessFrame leaves PipelineOutput::pointCloudData empty.
+    // Used to skip the work when nobody subscribes to / records the point cloud.
+    void setComputePointCloud(bool enable) { m_computePointCloud = enable; }
+    bool computePointCloud() const { return m_computePointCloud; }
+
 private:
     int preprocessPreparedNv12(FrameContextPtr& context);
 
+    std::atomic<bool> m_computePointCloud{true};
     std::string m_meshLeftPath = "/opt/data/npu_disp/mesh_left.txt";
     std::string m_meshRightPath = "/opt/data/npu_disp/mesh_right.txt";
     InferenceEngine m_inferenceEngine = InferenceEngine::NPU;
     bool m_sysInited = false;
     bool m_ivpsInited = false;
-    bool m_dspInited = false;
-    bool m_dspInitedSecondary = false;
-    bool m_dspCvInited = false;
-    bool m_dspCvInitedSecondary = false;
     bool m_engineInited = false;
     bool m_npuInited = false;
-    bool m_dspDualCoreEnabled = false;
-    bool m_dspDualCoreRequested = true;
     bool m_enableGdc = true;
     bool m_exportVoFrames = false;
     GdcMeshMode m_gdcMeshMode = GdcMeshMode::DynamicReuse;

@@ -4,6 +4,8 @@
 #include <array>
 #include <cctype>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <exception>
 #include <filesystem>
 #include <fstream>
@@ -581,6 +583,230 @@ int generateMeshFiles(const std::string& serialNumber, bool forceRegenerate,
     ALOGN("%s%s", forceRegenerate ? "Mesh file regenerated: " : "Mesh file generated: ",
           rightMeshPath.c_str());
     return 0;
+}
+
+bool buildHostRectifyMaps(const std::string& serialNumber, uint32_t inputWidth,
+                          uint32_t inputHeight, std::vector<float>& mapLeftX,
+                          std::vector<float>& mapLeftY, std::vector<float>& mapRightX,
+                          std::vector<float>& mapRightY, float& baselineMeters) {
+    if (serialNumber.empty()) {
+        return false;
+    }
+    const std::string iniPath = calibrationIniPath(serialNumber);
+    if (!isNonEmptyFile(iniPath)) {
+        ALOGW("host rectify maps: calibration ini missing: %s", iniPath.c_str());
+        return false;
+    }
+
+    CalibrationGeometry geometry;
+    StereoCalibrationData calibration;
+    std::string error;
+    if (!loadStereoCalibration(iniPath, inputWidth, inputHeight, geometry, calibration, error)) {
+        ALOGW("host rectify maps: %s", error.c_str());
+        return false;
+    }
+
+    RectificationData rectification;
+    if (!computeRectification(calibration, geometry, rectification, error)) {
+        ALOGW("host rectify maps: %s", error.c_str());
+        return false;
+    }
+
+    auto makeParam = [&](bool left) {
+        CameraParameter param;
+        param.imageWidth = geometry.perEyeWidth;
+        param.imageHeight = geometry.height;
+        param.outputWidth = kMeshOutputWidth;
+        param.outputHeight = kMeshOutputHeight;
+        param.cxOut = kMeshOutputCx;
+        param.cyOut = kMeshOutputCy;
+        param.fxOut = kMeshOutputFx;
+        param.fyOut = kMeshOutputFy;
+        const cv::Matx33d& K = left ? calibration.K1 : calibration.K2;
+        const cv::Vec4d& D = left ? calibration.D1 : calibration.D2;
+        param.fx = K(0, 0);
+        param.fy = K(1, 1);
+        param.cx = K(0, 2);
+        param.cy = K(1, 2);
+        param.rotation = left ? rectification.R1 : rectification.R2;
+        param.distParams = {D[0], D[1], D[2], D[3]};
+        param.hasDistParams = true;
+        return param;
+    };
+
+    const CameraParameter leftParam = makeParam(true);
+    const CameraParameter rightParam = makeParam(false);
+
+    const int outW = static_cast<int>(kMeshOutputWidth);
+    const int outH = static_cast<int>(kMeshOutputHeight);
+    const size_t count = static_cast<size_t>(outW) * static_cast<size_t>(outH);
+    mapLeftX.resize(count);
+    mapLeftY.resize(count);
+    mapRightX.resize(count);
+    mapRightY.resize(count);
+
+    auto fill = [&](const CameraParameter& param, std::vector<float>& mx, std::vector<float>& my) {
+        for (int y = 0; y < outH; ++y) {
+            for (int x = 0; x < outW; ++x) {
+                auto p = undistortProject(param, static_cast<double>(x), static_cast<double>(y));
+                p.first =
+                    std::max(0.0, std::min(p.first, static_cast<double>(param.imageWidth - 1)));
+                p.second =
+                    std::max(0.0, std::min(p.second, static_cast<double>(param.imageHeight - 1)));
+                const size_t idx = static_cast<size_t>(y) * outW + x;
+                mx[idx] = static_cast<float>(p.first);
+                my[idx] = static_cast<float>(p.second);
+            }
+        }
+    };
+
+    fill(leftParam, mapLeftX, mapLeftY);
+    fill(rightParam, mapRightX, mapRightY);
+
+    baselineMeters = static_cast<float>(cv::norm(calibration.T));
+    ALOGN("host rectify maps built from %s (baseline=%.6f m)", iniPath.c_str(), baselineMeters);
+    return true;
+}
+
+namespace {
+
+// Resolve the directory that ships the default models / meshes: env override,
+// then the directory next to the executable's models/, then the source models/.
+std::filesystem::path defaultMeshDirectory() {
+    std::error_code ec;
+    if (const char* env = std::getenv("STEREO_DEPTH_MESH_DIR"); env != nullptr && env[0] != '\0') {
+        return std::filesystem::path(env);
+    }
+    const std::filesystem::path exe = std::filesystem::read_symlink("/proc/self/exe", ec);
+    if (!ec && !exe.empty()) {
+        return exe.parent_path() / "models";
+    }
+    return std::filesystem::path(STEREO_DEPTH_APP_MODEL_DIR);
+}
+
+// Parse a GDC mesh .txt (16-hex-char lines, each one AX_U64) into a flat table.
+bool loadMeshTable(const std::string& path, std::vector<AX_U64>& table) {
+    std::FILE* fp = std::fopen(path.c_str(), "r");
+    if (fp == nullptr) {
+        return false;
+    }
+    char line[17];
+    while (std::fgets(line, sizeof(line), fp) != nullptr) {
+        if (std::strcmp(line, "\n") == 0) {
+            continue;
+        }
+        unsigned long long value = 0;
+        if (std::sscanf(line, "%llx", &value) == 1) {
+            table.push_back(static_cast<AX_U64>(value));
+        }
+    }
+    std::fclose(fp);
+    return !table.empty();
+}
+
+// Decode one GDC user mesh (33x33 grid, see generateMeshTableM76Gdc) into a full
+// per-pixel remap (source x/y for every output pixel).
+bool decodeMeshToRemap(const std::vector<AX_U64>& table, std::vector<float>& mapX,
+                       std::vector<float>& mapY) {
+    const AX_U32 cellW = alignUp(roundUpDiv(kMeshOutputWidth, kMeshTableCols - 1), kMeshAlignSize);
+    const AX_U32 cellH = alignUp(roundUpDiv(kMeshOutputHeight, kMeshTableRows - 1), kMeshAlignSize);
+    // Each row stores (cols + padding) points, two AX_U64 per point.
+    const size_t rowStride = static_cast<size_t>(kMeshTableCols + kMeshPaddingSize) * 2;
+    if (table.size() < rowStride * kMeshTableRows) {
+        return false;
+    }
+
+    cv::Mat gx(static_cast<int>(kMeshTableRows), static_cast<int>(kMeshTableCols), CV_32FC1);
+    cv::Mat gy(static_cast<int>(kMeshTableRows), static_cast<int>(kMeshTableCols), CV_32FC1);
+    for (AX_U32 r = 0; r < kMeshTableRows; ++r) {
+        for (AX_U32 c = 0; c < kMeshTableCols; ++c) {
+            const AX_U64 v = table[r * rowStride + static_cast<size_t>(c) * 2];
+            const int32_t diffCols = static_cast<int32_t>(static_cast<uint32_t>(v & 0xFFFFFFFFu));
+            const int32_t diffRows = static_cast<int32_t>(static_cast<uint32_t>(v >> 32));
+            const double destX = static_cast<double>(c) * cellW;
+            const double destY = static_cast<double>(r) * cellH;
+            gx.at<float>(static_cast<int>(r), static_cast<int>(c)) =
+                static_cast<float>(destX + diffCols / static_cast<double>(kMeshDiffFixFactor));
+            gy.at<float>(static_cast<int>(r), static_cast<int>(c)) =
+                static_cast<float>(destY + diffRows / static_cast<double>(kMeshDiffFixFactor));
+        }
+    }
+
+    const int outW = static_cast<int>(kMeshOutputWidth);
+    const int outH = static_cast<int>(kMeshOutputHeight);
+    mapX.assign(static_cast<size_t>(outW) * outH, 0.0f);
+    mapY.assign(static_cast<size_t>(outW) * outH, 0.0f);
+    for (int y = 0; y < outH; ++y) {
+        const double fy = static_cast<double>(y) / cellH;
+        int r0 = static_cast<int>(fy);
+        if (r0 > static_cast<int>(kMeshTableRows) - 2) r0 = static_cast<int>(kMeshTableRows) - 2;
+        const double ay = fy - r0;
+        for (int x = 0; x < outW; ++x) {
+            const double fx = static_cast<double>(x) / cellW;
+            int c0 = static_cast<int>(fx);
+            if (c0 > static_cast<int>(kMeshTableCols) - 2)
+                c0 = static_cast<int>(kMeshTableCols) - 2;
+            const double ax = fx - c0;
+            auto bilerp = [&](const cv::Mat& g) {
+                const double v00 = g.at<float>(r0, c0);
+                const double v01 = g.at<float>(r0, c0 + 1);
+                const double v10 = g.at<float>(r0 + 1, c0);
+                const double v11 = g.at<float>(r0 + 1, c0 + 1);
+                const double top = v00 + (v01 - v00) * ax;
+                const double bot = v10 + (v11 - v10) * ax;
+                return top + (bot - top) * ay;
+            };
+            const size_t idx = static_cast<size_t>(y) * outW + x;
+            mapX[idx] = static_cast<float>(bilerp(gx));
+            mapY[idx] = static_cast<float>(bilerp(gy));
+        }
+    }
+    return true;
+}
+
+}  // namespace
+
+bool resolveDefaultMeshPaths(uint32_t inputWidth, uint32_t inputHeight, std::string& leftMeshPath,
+                             std::string& rightMeshPath) {
+    CalibrationGeometry geometry;
+    std::string error;
+    if (!resolveCalibrationGeometry(inputWidth, inputHeight, geometry, error)) {
+        return false;
+    }
+    std::string res = geometry.resolution;  // "HD" or "FHD"
+    std::transform(res.begin(), res.end(), res.begin(),
+                   [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+
+    const std::filesystem::path dir = defaultMeshDirectory();
+    const std::filesystem::path left = dir / ("mesh_" + res + "_l_32x16.txt");
+    const std::filesystem::path right = dir / ("mesh_" + res + "_r_32x16.txt");
+    std::error_code ec;
+    if (!std::filesystem::exists(left, ec) || ec || !std::filesystem::exists(right, ec) || ec) {
+        return false;
+    }
+    leftMeshPath = left.string();
+    rightMeshPath = right.string();
+    return true;
+}
+
+bool buildHostRectifyMapsFromMesh(const std::string& leftMeshPath, const std::string& rightMeshPath,
+                                  std::vector<float>& mapLeftX, std::vector<float>& mapLeftY,
+                                  std::vector<float>& mapRightX, std::vector<float>& mapRightY) {
+    std::vector<AX_U64> leftTable;
+    std::vector<AX_U64> rightTable;
+    if (!loadMeshTable(leftMeshPath, leftTable) || !loadMeshTable(rightMeshPath, rightTable)) {
+        ALOGW("host mesh remap: failed to load mesh files %s / %s", leftMeshPath.c_str(),
+              rightMeshPath.c_str());
+        return false;
+    }
+    if (!decodeMeshToRemap(leftTable, mapLeftX, mapLeftY) ||
+        !decodeMeshToRemap(rightTable, mapRightX, mapRightY)) {
+        ALOGW("host mesh remap: failed to decode mesh tables");
+        return false;
+    }
+    ALOGN("host rectify maps built from mesh files (%s, %s)", leftMeshPath.c_str(),
+          rightMeshPath.c_str());
+    return true;
 }
 
 int downloadCalibrationFile(const std::string& serialNumber) {

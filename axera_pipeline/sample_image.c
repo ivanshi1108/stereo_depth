@@ -20,7 +20,7 @@
 #define DEWARP_IMAGE_WIDTH (RESIZE_IMAGE_WIDTH)
 #define DEWARP_IMAGE_HEIGHT (RESIZE_IMAGE_HEIGHT)
 
-#define AX_ALIGN_UP(x, a) ((((x) + (a)-1) / (a)) * (a))
+#define AX_ALIGN_UP(x, a) ((((x) + (a) - 1) / (a)) * (a))
 
 #define CHECK_POINTER(p)          \
     if (!p) {                     \

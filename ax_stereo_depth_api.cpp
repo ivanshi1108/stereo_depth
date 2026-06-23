@@ -25,8 +25,6 @@ struct AX_STEREO_OUTPUT_INTERNAL {
 
 static InferenceEngine toInternalEngine(AX_STEREO_ENGINE_E e) {
     switch (e) {
-        case AX_STEREO_ENGINE_DSP:
-            return InferenceEngine::DSP;
         case AX_STEREO_ENGINE_NPU:
         default:
             return InferenceEngine::NPU;
@@ -35,8 +33,6 @@ static InferenceEngine toInternalEngine(AX_STEREO_ENGINE_E e) {
 
 static AX_STEREO_ENGINE_E toApiEngine(InferenceEngine e) {
     switch (e) {
-        case InferenceEngine::DSP:
-            return AX_STEREO_ENGINE_DSP;
         case InferenceEngine::NPU:
         default:
             return AX_STEREO_ENGINE_NPU;
@@ -83,7 +79,6 @@ AX_S32 AX_STEREO_Create(AX_STEREO_HANDLE* phPipeline, const AX_STEREO_ATTR_T* ps
         attr.eEngine = AX_STEREO_ENGINE_NPU;
         attr.bEnableGdc = AX_TRUE;
         attr.eGdcMeshMode = AX_STEREO_GDC_MESH_DYNAMIC_REUSE;
-        attr.bDspDualCore = AX_TRUE;
         attr.bExportVoFrames = AX_FALSE;
         attr.s32InputWidth = AX_STEREO_DEFAULT_INPUT_WIDTH;
         attr.s32InputHeight = AX_STEREO_DEFAULT_INPUT_HEIGHT;
@@ -102,9 +97,8 @@ AX_S32 AX_STEREO_Create(AX_STEREO_HANDLE* phPipeline, const AX_STEREO_ATTR_T* ps
 
     AX_S32 ret = ctx->pipeline.initialize(
         toInternalEngine(attr.eEngine), attr.bEnableGdc == AX_TRUE,
-        toInternalGdcMeshMode(attr.eGdcMeshMode), attr.bDspDualCore == AX_TRUE,
-        attr.bExportVoFrames == AX_TRUE, npuModelPath, cameraSerialNumber, attr.s32InputWidth,
-        attr.s32InputHeight);
+        toInternalGdcMeshMode(attr.eGdcMeshMode), attr.bExportVoFrames == AX_TRUE, npuModelPath,
+        cameraSerialNumber, attr.s32InputWidth, attr.s32InputHeight);
 
     if (ret != 0) {
         delete ctx;
@@ -275,6 +269,15 @@ AX_F32 AX_STEREO_GetBaselineMeters(AX_STEREO_HANDLE hPipeline) {
 
     auto* ctx = static_cast<AX_STEREO_PIPELINE_CTX*>(hPipeline);
     return ctx->pipeline.cameraBaselineMeters();
+}
+
+AX_S32 AX_STEREO_SetComputePointCloud(AX_STEREO_HANDLE hPipeline, AX_BOOL bEnable) {
+    if (hPipeline == AX_NULL) {
+        return -1;
+    }
+    auto* ctx = static_cast<AX_STEREO_PIPELINE_CTX*>(hPipeline);
+    ctx->pipeline.setComputePointCloud(bEnable == AX_TRUE);
+    return 0;
 }
 
 AX_STEREO_ENGINE_E AX_STEREO_GetEngine(AX_STEREO_HANDLE hPipeline) {

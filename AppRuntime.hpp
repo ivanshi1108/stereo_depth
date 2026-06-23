@@ -1,5 +1,6 @@
 #pragma once
 
+#include "BackendSelect.hpp"
 #include "FoxgloveWrapper.hpp"
 #include "FrameInputSource.hpp"
 #include "ax_stereo_depth_api.h"
@@ -15,6 +16,7 @@ struct RuntimeOptions {
     uint32_t foxgloveFps = 15;
     bool enableVo = false;
     std::string dumpMcapPrefix;
+    Backend imgProcBackend = Backend::Auto;
 };
 
 class StereoDepthAppRuntime {

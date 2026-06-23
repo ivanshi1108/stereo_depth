@@ -8,8 +8,8 @@
 #define SAMPLE_LOG_TAG "GDC"
 #include "sample_log.h"
 
-#define AX_ROUND_UP_DIV(x, a) (((x) + (a)-1) / (a))
-#define AX_ALIGN_UP(x, a) ((((x) + (a)-1) / (a)) * (a))
+#define AX_ROUND_UP_DIV(x, a) (((x) + (a) - 1) / (a))
+#define AX_ALIGN_UP(x, a) ((((x) + (a) - 1) / (a)) * (a))
 
 #define CHECK_POINTER(p)        \
     if (!(p)) {                 \

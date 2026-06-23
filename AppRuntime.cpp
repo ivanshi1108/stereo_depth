@@ -1381,6 +1381,13 @@ int StereoDepthAppRuntime::run(std::atomic<bool>& running) {
             outPacket.captureSteadyNs = stagePacket.captureSteadyNs;
             outPacket.laserDistance = stagePacket.laserDistance;
             outPacket.output = std::make_shared<StereoOutputOwner>();
+            // Only generate the (CPU-heavy) point cloud when it is actually
+            // consumed: a Foxglove subscriber for /camera/pointcloud, or an
+            // active MCAP recording / single-frame dump that would store it.
+            const bool needPointCloud = m_foxglove.hasSubscribers(topics.cloudTopic()) ||
+                                        recording.load(std::memory_order_acquire) ||
+                                        singleFrameDumpRequested.load(std::memory_order_acquire);
+            AX_STEREO_SetComputePointCloud(m_hPipeline, needPointCloud ? AX_TRUE : AX_FALSE);
             const auto postBegin = std::chrono::steady_clock::now();
             const int postRet = AX_STEREO_GetResult(m_hPipeline, stagePacket.context,
                                                     &outPacket.output->stereoOutput);
@@ -1876,6 +1883,15 @@ int StereoDepthAppRuntime::run(std::atomic<bool>& running) {
             const auto voEnd = std::chrono::steady_clock::now();
             const uint64_t voUs = static_cast<uint64_t>(
                 std::chrono::duration_cast<std::chrono::microseconds>(voEnd - voBegin).count());
+
+            // Closing the preview window stops the application.
+            if (voEnabled && voDisplayPtr->isWindowClosed()) {
+                running = false;
+                notifyAll(frameQueueNotEmptyCv, frameQueueNotFullCv, preInferQueueNotEmptyCv,
+                          preInferQueueNotFullCv, inferPostQueueNotEmptyCv, inferPostQueueNotFullCv,
+                          outputQueueNotEmptyCv, outputQueueNotFullCv, voQueueNotEmptyCv);
+                break;
+            }
 
             if (perfTrace) {
                 std::lock_guard<std::mutex> lockPerf(perfAccumMutex);

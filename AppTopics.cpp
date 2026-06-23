@@ -182,8 +182,7 @@ bool StereoDepthTopics::registerFoxgloveChannels(FoxgloveWrapper& foxglove) cons
 std::vector<std::byte> StereoDepthTopics::makeDeviceInfoJson(
     const stereo_depth::InputSourceInfo& inputInfo) const {
     std::ostringstream oss;
-    oss << "{"
-        << "\"input_mode\":\""
+    oss << "{" << "\"input_mode\":\""
         << (inputInfo.mode == stereo_depth::InputMode::Uvc ? "uvc" : "image_file") << "\",";
 
     oss << "\"device\":\"" << escapeJsonString(inputInfo.device) << "\",";

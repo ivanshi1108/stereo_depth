@@ -1,9 +1,12 @@
 #include "AppRuntime.hpp"
+#include "BackendSelect.hpp"
 #include "FoxgloveWrapper.hpp"
 #include "FrameInputSource.hpp"
 #include "StereoDepthPipeline.hpp"
 #include "V4L2Capture.hpp"
 #include "ax_stereo_depth_api.h"
+#include "host_backend/HostPrecheck.hpp"
+#include "host_backend/ImageProcBackend.hpp"
 
 #define SAMPLE_LOG_TAG "APP"
 #include "sample_log.h"
@@ -41,15 +44,14 @@ struct AppOptions {
     bool listAllUvcControls = false;
     bool resetUvcControls = false;
     bool perfTrace = false;
-    bool enableVo = false;
-    AX_STEREO_ENGINE_E inferenceEngine = AX_STEREO_ENGINE_NPU;
+    bool enableVo = true;
     std::string npuModelPath = AX_STEREO_GetDefaultModelPath();
     bool enableGdc = true;
     AX_STEREO_GDC_MESH_MODE_E gdcMeshMode = AX_STEREO_GDC_MESH_DYNAMIC_REUSE;
-    bool dspDualCore = true;
     uint32_t foxgloveFps = 15;
     size_t messageBacklogSize = 10;
     std::string dumpMcapPrefix = kDefaultDumpMcapPrefix;
+    stereo_depth::Backend imgProcBackend = stereo_depth::Backend::Auto;
 };
 
 void printUsage(const char* progName) {
@@ -65,17 +67,19 @@ void printUsage(const char* progName) {
     ALOGN("  -l             List supported UVC resolutions and fps, then exit");
     ALOGN("  -i <file>      Use specified input .yuyv or .mcap file instead of UVC capture");
     ALOGN("  --mcap-stream <mode>            MCAP import source: yuyv | h264 (default: yuyv)");
-    ALOGN("  -e <engine>    Inference engine: npu | dsp (default: npu)");
     ALOGN("  -m <model>     NPU model path (default: %s)", AX_STEREO_GetDefaultModelPath());
     ALOGN(
         "  -g <gdc>       GDC mode: on | force | builtin | off (on=reuse/download ini, reuse "
         "mesh or generate if missing, force=always regenerate mesh, builtin=use built-in mesh, "
         "default: "
         "on)");
-    ALOGN("  -c <core>      DSP core mode: dual|single|2|1 (default: dual)");
     ALOGN("  -q <depth>     Foxglove message backlog size per client (default: 10)");
     ALOGN("  -t             Enable performance trace logs");
-    ALOGN("  --vo                           Enable HDMI VO preview with 4 channels");
+    ALOGN("  --vo                           Enable VO preview window (default: on)");
+    ALOGN("  --no-vo                        Disable the VO preview window");
+    ALOGN(
+        "  --imgproc <backend>            Image processing backend: host | axcl | auto (default: "
+        "auto)");
     ALOGN(
         "  --uvc-list-all-controls          List all V4L2 controls exposed by the device, then "
         "exit");
@@ -91,25 +95,6 @@ void printUsage(const char* progName) {
     ALOGN("  --uvc-white-balance-temperature <n> Set V4L2_CID_WHITE_BALANCE_TEMPERATURE");
     ALOGN("  --uvc-power-line-frequency <mode> Set V4L2_CID_POWER_LINE_FREQUENCY: off|50|60");
     ALOGN("  --uvc-gain <n>                   Set V4L2_CID_GAIN");
-}
-
-bool parseEngineOption(const char* arg, AX_STEREO_ENGINE_E& engine) {
-    if (arg == nullptr) {
-        return false;
-    }
-
-    std::string engineStr(arg);
-    std::transform(engineStr.begin(), engineStr.end(), engineStr.begin(),
-                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-    if (engineStr == "npu") {
-        engine = AX_STEREO_ENGINE_NPU;
-        return true;
-    }
-    if (engineStr == "dsp") {
-        engine = AX_STEREO_ENGINE_DSP;
-        return true;
-    }
-    return false;
 }
 
 bool parseBoolOption(const char* arg, bool& value) {
@@ -173,26 +158,6 @@ const char* gdcModeName(bool enableGdc, AX_STEREO_GDC_MESH_MODE_E meshMode) {
         default:
             return "unknown";
     }
-}
-
-bool parseDspCoreOption(const char* arg, bool& dspDualCore) {
-    if (arg == nullptr) {
-        return false;
-    }
-
-    std::string text(arg);
-    std::transform(text.begin(), text.end(), text.begin(),
-                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-
-    if (text == "2" || text == "dual" || text == "dualcore") {
-        dspDualCore = true;
-        return true;
-    }
-    if (text == "1" || text == "single" || text == "singlecore") {
-        dspDualCore = false;
-        return true;
-    }
-    return false;
 }
 
 bool parseIntOption(const char* arg, int32_t& value) {
@@ -325,10 +290,12 @@ bool parseArgs(int argc, char** argv, AppOptions& options) {
         kOptUvcWhiteBalanceTemperature,
         kOptUvcPowerLineFrequency,
         kOptVoEnable,
+        kOptVoDisable,
         kOptUvcListAllControls,
         kOptUvcResetControls,
         kOptUvcGain,
         kOptMcapStream,
+        kOptImgProcBackend,
     };
 
     static const option longOptions[] = {
@@ -342,17 +309,19 @@ bool parseArgs(int argc, char** argv, AppOptions& options) {
          kOptUvcWhiteBalanceTemperature},
         {"uvc-power-line-frequency", required_argument, nullptr, kOptUvcPowerLineFrequency},
         {"vo", no_argument, nullptr, kOptVoEnable},
+        {"no-vo", no_argument, nullptr, kOptVoDisable},
         {"uvc-list-all-controls", no_argument, nullptr, kOptUvcListAllControls},
         {"uvc-reset-controls", no_argument, nullptr, kOptUvcResetControls},
         {"uvc-gain", required_argument, nullptr, kOptUvcGain},
         {"mcap-stream", required_argument, nullptr, kOptMcapStream},
+        {"imgproc", required_argument, nullptr, kOptImgProcBackend},
         {nullptr, 0, nullptr, 0},
     };
 
     int opt = 0;
     int longIndex = 0;
-    while ((opt = getopt_long(argc, argv, "d:s:w:h:f:F:r:e:m:g:c:i:q:lt", longOptions,
-                              &longIndex)) != -1) {
+    while ((opt = getopt_long(argc, argv, "d:s:w:h:f:F:r:m:g:i:q:lt", longOptions, &longIndex)) !=
+           -1) {
         switch (opt) {
             case 'd':
                 options.input.device = optarg;
@@ -385,11 +354,6 @@ bool parseArgs(int argc, char** argv, AppOptions& options) {
                 }
                 options.dumpMcapPrefix = normalizeDumpMcapPrefix(optarg);
                 break;
-            case 'e':
-                if (!parseEngineOption(optarg, options.inferenceEngine)) {
-                    return false;
-                }
-                break;
             case 'm':
                 if (optarg[0] == '\0') {
                     return false;
@@ -398,11 +362,6 @@ bool parseArgs(int argc, char** argv, AppOptions& options) {
                 break;
             case 'g':
                 if (!parseGdcOption(optarg, options.enableGdc, options.gdcMeshMode)) {
-                    return false;
-                }
-                break;
-            case 'c':
-                if (!parseDspCoreOption(optarg, options.dspDualCore)) {
                     return false;
                 }
                 break;
@@ -426,6 +385,9 @@ bool parseArgs(int argc, char** argv, AppOptions& options) {
                 break;
             case kOptVoEnable:
                 options.enableVo = true;
+                break;
+            case kOptVoDisable:
+                options.enableVo = false;
                 break;
             case kOptUvcBrightness: {
                 int32_t value = 0;
@@ -510,6 +472,11 @@ bool parseArgs(int argc, char** argv, AppOptions& options) {
                     return false;
                 }
                 break;
+            case kOptImgProcBackend:
+                if (!stereo_depth::parseBackend(optarg ? optarg : "", options.imgProcBackend)) {
+                    return false;
+                }
+                break;
             default:
                 return false;
         }
@@ -539,6 +506,26 @@ int main(int argc, char** argv) {
         return V4L2Capture::resetAllControlsToDefault(options.input.device) ? 0 : 1;
     }
 
+    // Refuse to run a second instance: the Axera card cannot be shared between
+    // processes (the second one deadlocks).
+    {
+        std::string reason;
+        if (!stereo_depth::host_backend::acquireSingleInstanceLock(reason)) {
+            ALOGE("%s", reason.c_str());
+            return 1;
+        }
+    }
+
+    // Verify the AXCL host driver is loaded and axcl-smi works before touching
+    // the card.
+    {
+        std::string reason;
+        if (!stereo_depth::host_backend::checkAxclHostReady(reason)) {
+            ALOGE("%s", reason.c_str());
+            return 1;
+        }
+    }
+
     if (!options.input.useImageFile && !stereo_depth::isSupportedStereoInputResolution(
                                            options.input.width, options.input.height)) {
         ALOGE("unsupported stereo resolution: %dx%d (supported: 2560x720, 3840x1080)",
@@ -552,13 +539,17 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    // Select the image-processing backend (host CPU vs. AXCL IVPS). This is done
+    // only after the input source is ready so a missing camera does not leave
+    // the AXCL card half-initialized (which aborts at exit). It must run before
+    // AX_STEREO_Create so the pipeline can pick up the AXCL dewarp path.
+    stereo_depth::setImageProcBackend(options.imgProcBackend);
+
     /* Create stereo depth pipeline via AX API */
     AX_STEREO_ATTR_T stStereoAttr;
     std::memset(&stStereoAttr, 0, sizeof(stStereoAttr));
-    stStereoAttr.eEngine = options.inferenceEngine;
     stStereoAttr.bEnableGdc = options.enableGdc ? AX_TRUE : AX_FALSE;
     stStereoAttr.eGdcMeshMode = options.gdcMeshMode;
-    stStereoAttr.bDspDualCore = options.dspDualCore ? AX_TRUE : AX_FALSE;
     stStereoAttr.bExportVoFrames = options.enableVo ? AX_TRUE : AX_FALSE;
     stStereoAttr.s32InputWidth = inputSource.info().width;
     stStereoAttr.s32InputHeight = inputSource.info().height;
@@ -574,6 +565,7 @@ int main(int argc, char** argv) {
     AX_STEREO_HANDLE hPipeline = AX_NULL;
     int ret = AX_STEREO_Create(&hPipeline, &stStereoAttr);
     if (ret != 0) {
+        stereo_depth::shutdownImageProcBackend();
         return ret;
     }
 
@@ -585,24 +577,20 @@ int main(int argc, char** argv) {
     foxgloveOptions.max_publish_fps = 0;
     foxgloveOptions.message_backlog_size = options.messageBacklogSize;
     if (!foxglove.start(foxgloveOptions)) {
+        AX_STEREO_Destroy(hPipeline);
+        stereo_depth::shutdownImageProcBackend();
         return 1;
     }
-    if (options.inferenceEngine == AX_STEREO_ENGINE_DSP) {
-        ALOGN("Press Ctrl+C to stop. engine=%s gdc=%s dsp_core=%s",
-              AX_STEREO_GetEngineName(options.inferenceEngine),
-              gdcModeName(options.enableGdc, options.gdcMeshMode),
-              options.dspDualCore ? "dual" : "single");
-    } else {
-        ALOGN("Press Ctrl+C to stop. engine=%s gdc=%s model=%s",
-              AX_STEREO_GetEngineName(options.inferenceEngine),
-              gdcModeName(options.enableGdc, options.gdcMeshMode), options.npuModelPath.c_str());
-    }
+    ALOGN("Press Ctrl+C to stop. engine=%s gdc=%s model=%s",
+          AX_STEREO_GetEngineName(AX_STEREO_ENGINE_NPU),
+          gdcModeName(options.enableGdc, options.gdcMeshMode), options.npuModelPath.c_str());
 
     stereo_depth::app::RuntimeOptions runtimeOptions;
     runtimeOptions.perfTrace = options.perfTrace;
     runtimeOptions.foxgloveFps = options.foxgloveFps;
     runtimeOptions.enableVo = options.enableVo;
     runtimeOptions.dumpMcapPrefix = options.dumpMcapPrefix;
+    runtimeOptions.imgProcBackend = options.imgProcBackend;
 
     stereo_depth::app::StereoDepthAppRuntime runtime(runtimeOptions, hPipeline, inputSource,
                                                      foxglove);
@@ -612,6 +600,7 @@ int main(int argc, char** argv) {
     ALOGN("Visualization stopped");
 
     AX_STEREO_Destroy(hPipeline);
+    stereo_depth::shutdownImageProcBackend();
 
     return ret;
 }
