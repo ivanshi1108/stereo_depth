@@ -4,9 +4,11 @@
 // Host/AXCL port: only AX data types are needed here (GDC_HANDLE lives in
 // ax_ivps_type.h, AX_VIDEO_FRAME_T in ax_global_type.h). ax_ivps_type.h refers
 // to AX_POOL types, so ax_pool_type.h must be included first.
+// clang-format off
 #include "ax_global_type.h"
-#include "ax_ivps_type.h"
 #include "ax_pool_type.h"
+#include "ax_ivps_type.h"
+// clang-format on
 
 #define SAMPLE_PIPE_NUM (2)
 
