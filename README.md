@@ -1,4 +1,4 @@
-# Stereo Depth 示例（AXCL版本）
+# Stereo Depth 示例（AXCL版）
 
 ## 架构设计
 ![系统架构](res/pipeline.png)
@@ -8,9 +8,10 @@
 | 硬件平台 | 操作系统 |
 | --- | --- |
 | Raspberry Pi 5 | Debian GNU/Linux 13 (trixie) |
+| RK3588 OPi 5 Plus | Ubuntu 22.04.5 LTS |
 | AMD64 PC | Ubuntu 22.04.4 LTS |
 
-## 支持的模组
+## 支持的双目模组
 
 - ZED Mini Stereo Camera
 
@@ -57,31 +58,34 @@ cd output/sample_stereo_depth
 ./sample_stereo_depth
 ```
 
-### 回放 MCAP 文件
+### 运行效果
+#### Raspberry Pi 5
+https://github.com/user-attachments/assets/b6032c92-cc0a-46af-8198-5126754b5259
+#### RK3588 OPi 5 Plus
+https://github.com/user-attachments/assets/414acdc6-9565-4a1a-a619-64f3e12e51d3
+#### AMD64 PC （Ubuntu）
+https://github.com/user-attachments/assets/fe89d0e7-c142-49f3-b033-bca0b674f95e
+
+
+
+### 其他常用操作
+#### 回放 MCAP 文件
 
 ```bash
 ./sample_stereo_depth -i /path/to/your_dump.mcap
 ./sample_stereo_depth -i /path/to/your_dump.mcap --mcap-stream h264 # 回放录制里的 H.264 流
 ```
 
-### 不开预览窗口（无桌面预览，仅 foxglove 发布）
+#### 不开预览窗口（无桌面预览，仅 foxglove 发布）
 
 ```bash
 ./sample_stereo_depth --no-vo -i /path/to/your_dump.mcap
 ```
 
-### --imgproc参数说明
+#### --imgproc参数说明
 - `--imgproc <host|axcl|auto>`：图像处理后端，**默认 `auto`**。
 - `auto` / `axcl`：优先用算力卡 IVPS 做图像处理，失败时自动回退HOST CPU。
 - `host`：全部用HOST CPU 执行图像处理。
-
-## 常见说明
-- 默认 NPU 模型从安装目录 `models/axstereo_pro.axmodel` 加载。
-- 运行前会检查 AXCL host 驱动（`/dev/axcl_host`）与 `axcl-smi`，不满足则拒绝运行。
-- 点云仅在 `/camera/pointcloud` 有订阅或正在录制时才计算，以节省 CPU。
-
-## Raspberry Pi 5 操作视频
-https://github.com/user-attachments/assets/0cee58bf-c417-4cf5-ae5a-0ba4cfece0a3
 
 ## 详细说明
 
