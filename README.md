@@ -80,6 +80,9 @@ cd output/sample_stereo_depth
 - 运行前会检查 AXCL host 驱动（`/dev/axcl_host`）与 `axcl-smi`，不满足则拒绝运行。
 - 点云仅在 `/camera/pointcloud` 有订阅或正在录制时才计算，以节省 CPU。
 
+## Raspberry Pi 5 操作视频
+https://github.com/user-attachments/assets/0cee58bf-c417-4cf5-ae5a-0ba4cfece0a3
+
 ## 详细说明
 
 - 更完整的运行参数，请参阅 https://zhuanlan.zhihu.com/p/2047786127969477270。
