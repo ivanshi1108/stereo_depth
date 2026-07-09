@@ -1,6 +1,19 @@
 # Stereo Depth 示例
 
-## 板上编译
+## 操作示例
+
+
+本视频示例使用的运行环境：
+
+- 开发板：[爱芯派 / Maix-IV M4N Dock](https://wiki.sipeed.com/hardware/zh/maixIV/m4ndock/m4ndock.html)
+- 系统镜像：[AX650_pipro_box_ubuntu_rootfs_desktop_V3.10.2_20260610103629.axp](https://huggingface.co/AXERA-TECH/BoardImages/blob/main/AX650_pipro_box_ubuntu_rootfs_desktop_V3.10.2_20260610103629.axp)
+
+编译及运行
+
+HDMI0 输出效果
+
+## 操作命令
+### 编译
 
 在工程根目录执行：
 
@@ -19,7 +32,7 @@ make install
 
 - `output/sample_stereo_depth/`
 
-## 运行
+### 运行
 
 安装后的目录结构如下：
 
@@ -33,21 +46,21 @@ output/sample_stereo_depth/
 
 运行时需要把安装目录里的 `lib/` 和平台库目录 `/soc/lib` 加进 `LD_LIBRARY_PATH`。
 
-### 默认运行
+#### 默认运行
 
 ```bash
 cd /root/stereo_depth/output/sample_stereo_depth
 LD_LIBRARY_PATH="$PWD/lib:/soc/lib:$LD_LIBRARY_PATH" ./sample_stereo_depth
 ```
 
-### 开启 HDMI VO 预览
+#### 开启 HDMI VO 预览
 
 ```bash
 cd /root/stereo_depth/output/sample_stereo_depth
 LD_LIBRARY_PATH="$PWD/lib:/soc/lib:$LD_LIBRARY_PATH" ./sample_stereo_depth --vo
 ```
 
-### 回放 MCAP 文件
+#### 回放 MCAP 文件
 
 ```bash
 cd /root/stereo_depth/output/sample_stereo_depth
@@ -55,7 +68,7 @@ LD_LIBRARY_PATH="$PWD/lib:/soc/lib:$LD_LIBRARY_PATH" \
 ./sample_stereo_depth --vo -i /root/your_dump.mcap
 ```
 
-### 只检查可支持的 UVC 模式
+#### 只检查可支持的 UVC 模式
 
 ```bash
 cd /root/stereo_depth/output/sample_stereo_depth
@@ -78,5 +91,5 @@ LD_LIBRARY_PATH="$PWD/lib:/soc/lib:$LD_LIBRARY_PATH" \
 
 ## 详细说明
 
-- 更完整的运行参数、输入格式、Foxglove、MCAP、VO、GDC、录制与性能说明，请看 [`README_CN.md`](README_CN.md)。
+- 更完整的运行参数、输入格式、Foxglove、MCAP、VO、GDC、录制与性能说明，请看 [`双目深度stereo_depth使用说明-v20-20260630_163329.pdf`](双目深度stereo_depth使用说明-v20-20260630_163329.pdf)。
 
