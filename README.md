@@ -6,11 +6,23 @@
 本视频示例使用的运行环境：
 
 - 开发板：[爱芯派 / Maix-IV M4N Dock](https://wiki.sipeed.com/hardware/zh/maixIV/m4ndock/m4ndock.html)
+- 
 - 系统镜像：[AX650_pipro_box_ubuntu_rootfs_desktop_V3.10.2_20260610103629.axp](https://huggingface.co/AXERA-TECH/BoardImages/blob/main/AX650_pipro_box_ubuntu_rootfs_desktop_V3.10.2_20260610103629.axp)
 
 编译及运行
 
+
+https://github.com/user-attachments/assets/fef81d10-23aa-491c-8f4a-6cdc03a81588
+
+
+
 HDMI0 输出效果
+
+
+
+https://github.com/user-attachments/assets/42bdc123-7469-4e46-9c3e-ef4045ccf63d
+
+
 
 ## 操作命令
 ### 编译
