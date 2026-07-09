@@ -6,7 +6,6 @@
 本视频示例使用的运行环境：
 
 - 开发板：[爱芯派 / Maix-IV M4N Dock](https://wiki.sipeed.com/hardware/zh/maixIV/m4ndock/m4ndock.html)
-- 
 - 系统镜像：[AX650_pipro_box_ubuntu_rootfs_desktop_V3.10.2_20260610103629.axp](https://huggingface.co/AXERA-TECH/BoardImages/blob/main/AX650_pipro_box_ubuntu_rootfs_desktop_V3.10.2_20260610103629.axp)
 
 编译及运行
@@ -103,5 +102,5 @@ LD_LIBRARY_PATH="$PWD/lib:/soc/lib:$LD_LIBRARY_PATH" \
 
 ## 详细说明
 
-- 更完整的运行参数、输入格式、Foxglove、MCAP、VO、GDC、录制与性能说明，请看 [`双目深度stereo_depth使用说明-v20-20260630_163329.pdf`](双目深度stereo_depth使用说明-v20-20260630_163329.pdf)。
+- 更完整的运行参数、输入格式、Foxglove、MCAP、VO、GDC、录制与性能说明，请看 [`stereo_depth_user_guide_v20_20260630_163329.pdf`](stereo_depth_user_guide_v20_20260630_163329.pdf)。
 
